@@ -1,0 +1,10 @@
+#!/bin/sh
+#
+# Run script for snmp2mqtt
+#
+# (c) André Deuerling, 2025
+#
+
+. venv/bin/activate
+
+exec /usr/bin/env python snmp2mqtt
