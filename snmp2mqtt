@@ -62,8 +62,18 @@ def parse_config():
         ):
             if k in data:
                 v = data[k]
-                if isinstance(getattr(daemon_args, k, None), bool) and isinstance(v, str):
-                    v = v.lower() == 'true'
+                current = getattr(daemon_args, k, None)
+                # Coerce common types based on argparse defaults
+                try:
+                    if isinstance(current, bool) and isinstance(v, str):
+                        v = v.lower() == 'true'
+                    elif isinstance(current, int) and isinstance(v, str):
+                        v = int(v)
+                    elif isinstance(current, float) and isinstance(v, str):
+                        v = float(v)
+                except Exception:
+                    # Fall back to raw value if coercion fails
+                    pass
                 setattr(daemon_args, k, v)
         if 'targets' in data:
             daemon_args.targets = data['targets']
@@ -104,7 +114,14 @@ def init_mqtt():
         client.enable_logger()
     if daemon_args.mqtt_user and daemon_args.mqtt_password:
         client.username_pw_set(daemon_args.mqtt_user, daemon_args.mqtt_password)
-    client.connect(daemon_args.mqtt_host, daemon_args.mqtt_port, daemon_args.mqtt_keepalive)
+    # Use async connect so startup does not fail if broker is unreachable.
+    try:
+        client.connect_async(daemon_args.mqtt_host, daemon_args.mqtt_port, daemon_args.mqtt_keepalive)
+        # Backoff for reconnect attempts
+        if hasattr(client, 'reconnect_delay_set'):
+            client.reconnect_delay_set(min_delay=1, max_delay=30)
+    except Exception as e:
+        logging.warning(f"Failed to start MQTT connection: {e}")
     return client
 
 
