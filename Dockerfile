@@ -1,10 +1,12 @@
-FROM python:3.12-alpine
+FROM astral/uv:python3.12-alpine
 
 WORKDIR /app
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml README.md LICENSE.md ./
+COPY src ./src
 
-COPY snmp2mqtt ./
+RUN uv pip install --system --editable .
 
-CMD [ "python", "./snmp2mqtt" ]
+ENV PYTHONUNBUFFERED=1
+
+CMD ["snmp2mqtt"]
