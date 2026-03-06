@@ -1,3 +1,4 @@
 # Python requirements
+iot-daemonize
 paho-mqtt
 pysnmp

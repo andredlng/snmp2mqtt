@@ -1,128 +1,15 @@
 #!/usr/bin/env python
 
-import argparse
 import asyncio
-import json
 import logging
-import signal
-import sys
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
-import paho.mqtt.client as mqtt
+import iot_daemonize
+import iot_daemonize.configuration as configuration
 from pysnmp.hlapi.v3arch.asyncio import *
 
 
-mqtt_client: Optional[mqtt.Client] = None
-daemon_args = None
-snmp_engine = None
-poll_tasks: List[asyncio.Task] = []
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        prog='snmp2mqtt',
-        description='An SNMP to MQTT bridge',
-        epilog='Have a lot of fun!'
-    )
-    # MQTT options
-    parser.add_argument('-m', '--mqtt_host', type=str, default='localhost', help='MQTT server hostname.')
-    parser.add_argument('--mqtt_port', type=int, default=1883, help='MQTT server port.')
-    parser.add_argument('--mqtt_keepalive', type=int, default=30, help='MQTT keep alive (seconds).')
-    parser.add_argument('--mqtt_clientid', type=str, default='snmp2mqtt', help='MQTT client id.')
-    parser.add_argument('-u', '--mqtt_user', type=str, help='MQTT username.')
-    parser.add_argument('-p', '--mqtt_password', type=str, help='MQTT password.')
-    parser.add_argument('-t', '--mqtt_topic', type=str, default='bus/snmp', help='Base topic to publish messages.')
-    parser.add_argument('--mqtt_tls', default=False, action='store_true', help='Enable MQTT TLS.')
-    parser.add_argument('--mqtt_tls_version', type=str, default='TLSv1.2', help='TLS version (TLSv1, TLSv1.1, TLSv1.2).')
-    parser.add_argument('--mqtt_verify_mode', type=str, default='CERT_REQUIRED', help='TLS verify mode (CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED).')
-    parser.add_argument('--mqtt_ssl_ca_path', type=str, help='CA file path for MQTT TLS.')
-    parser.add_argument('--mqtt_tls_no_verify', default=False, action='store_true', help='Disable TLS hostname verification.')
-
-    # General
-    parser.add_argument('-c', '--config', type=str, default='/etc/snmp2mqtt.conf', help='Path to config file.')
-    parser.add_argument('-z', '--timestamp', default=False, action='store_true', help='Publish timestamps for all topics.')
-    parser.add_argument('-v', '--verbose', default=False, action='store_true', help='Verbose logging.')
-    return parser.parse_args()
-
-
-def parse_config():
-    global daemon_args
-    daemon_args.targets = []
-    if daemon_args.config and not os_path_isfile(daemon_args.config):
-        return
-    if not daemon_args.config:
-        return
-    with open(daemon_args.config, 'r') as f:
-        data = json.load(f)
-        for k in (
-            'mqtt_host', 'mqtt_port', 'mqtt_keepalive', 'mqtt_clientid', 'mqtt_user', 'mqtt_password',
-            'mqtt_topic', 'mqtt_tls', 'mqtt_tls_version', 'mqtt_verify_mode', 'mqtt_ssl_ca_path', 'mqtt_tls_no_verify',
-            'timestamp', 'verbose'
-        ):
-            if k in data:
-                v = data[k]
-                current = getattr(daemon_args, k, None)
-                # Coerce common types based on argparse defaults
-                try:
-                    if isinstance(current, bool) and isinstance(v, str):
-                        v = v.lower() == 'true'
-                    elif isinstance(current, int) and isinstance(v, str):
-                        v = int(v)
-                    elif isinstance(current, float) and isinstance(v, str):
-                        v = float(v)
-                except Exception:
-                    # Fall back to raw value if coercion fails
-                    pass
-                setattr(daemon_args, k, v)
-        if 'targets' in data:
-            daemon_args.targets = data['targets']
-
-
-def os_path_isfile(path: str) -> bool:
-    try:
-        import os
-        return os.path.isfile(path)
-    except Exception:
-        return False
-
-
-verify_mode = {
-    'CERT_NONE': __import__('ssl').CERT_NONE,
-    'CERT_OPTIONAL': __import__('ssl').CERT_OPTIONAL,
-    'CERT_REQUIRED': __import__('ssl').CERT_REQUIRED,
-}
-
-tls_versions = {
-    'TLSv1': __import__('ssl').PROTOCOL_TLSv1,
-    'TLSv1.1': __import__('ssl').PROTOCOL_TLSv1_1,
-    'TLSv1.2': __import__('ssl').PROTOCOL_TLSv1_2,
-}
-
-
-def init_mqtt():
-    logging.debug('Starting MQTT')
-    global daemon_args
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, daemon_args.mqtt_clientid)
-    if daemon_args.mqtt_tls:
-        cert_reqs = verify_mode.get(daemon_args.mqtt_verify_mode)
-        tls_version = tls_versions.get(daemon_args.mqtt_tls_version)
-        ca_certs = daemon_args.mqtt_ssl_ca_path if daemon_args.mqtt_ssl_ca_path else None
-        client.tls_set(ca_certs=ca_certs, cert_reqs=cert_reqs, tls_version=tls_version)
-        client.tls_insecure_set(daemon_args.mqtt_tls_no_verify)
-    if daemon_args.verbose:
-        client.enable_logger()
-    if daemon_args.mqtt_user and daemon_args.mqtt_password:
-        client.username_pw_set(daemon_args.mqtt_user, daemon_args.mqtt_password)
-    # Use async connect so startup does not fail if broker is unreachable.
-    try:
-        client.connect_async(daemon_args.mqtt_host, daemon_args.mqtt_port, daemon_args.mqtt_keepalive)
-        # Backoff for reconnect attempts
-        if hasattr(client, 'reconnect_delay_set'):
-            client.reconnect_delay_set(min_delay=1, max_delay=30)
-    except Exception as e:
-        logging.warning(f"Failed to start MQTT connection: {e}")
-    return client
+config = None
 
 
 def _auth_protocol(name: Optional[str]):
@@ -196,9 +83,9 @@ def _transform(value_str: str, transform: Optional[str]) -> str:
     return value_str
 
 
-async def poll_scalar_once(auth, transport, oid: str) -> List[Tuple[str, str]]:
+async def poll_scalar_once(engine, auth, transport, oid: str) -> List[Tuple[str, str]]:
     errorIndication, errorStatus, errorIndex, varBinds = await get_cmd(
-        snmp_engine,
+        engine,
         auth,
         transport,
         ContextData(),
@@ -214,24 +101,22 @@ async def poll_scalar_once(auth, transport, oid: str) -> List[Tuple[str, str]]:
     return results
 
 
-async def poll_scalar(target_name: str, auth, transport, oid_cfg: Dict[str, Any]):
-    base_topic = f"{daemon_args.mqtt_topic}/{target_name}"
+async def poll_scalar(target_name: str, engine, auth, transport, oid_cfg: Dict[str, Any], stop):
+    base_topic = f"{config.mqtt_topic}/{target_name}"
     oid = oid_cfg['oid']
     name = oid_cfg.get('name') or oid
-    while True:
+    while not stop():
         try:
-            varBinds = await poll_scalar_once(auth, transport, oid)
+            varBinds = await poll_scalar_once(engine, auth, transport, oid)
             for _name, val in varBinds:
                 payload = _transform(val, oid_cfg.get('transform'))
-                publish_mqtt(f"{base_topic}/{name}", payload)
+                iot_daemonize.mqtt_client.publish(f"{base_topic}/{name}", payload)
         except Exception as e:
             logging.warning(f"SNMP GET error for {target_name} {oid}: {e}")
         await asyncio.sleep(int(target_interval(transport)))
 
 
 def target_interval(transport) -> int:
-    # transport is UdpTransportTarget((host, port), timeout=..., retries=...)
-    # store desired interval on transport via attribute
     return getattr(transport, '_interval', 30)
 
 
@@ -245,10 +130,10 @@ def compute_index_suffix(root_oid: str, full_oid: str) -> str:
     return ''
 
 
-async def walk_once(auth, transport, root_oid: str) -> List[Tuple[str, str]]:
+async def walk_once(engine, auth, transport, root_oid: str) -> List[Tuple[str, str]]:
     results: List[Tuple[str, str]] = []
     async for (errorIndication, errorStatus, errorIndex, varBinds) in next_cmd(
-        snmp_engine,
+        engine,
         auth,
         transport,
         ContextData(),
@@ -264,35 +149,26 @@ async def walk_once(auth, transport, root_oid: str) -> List[Tuple[str, str]]:
     return results
 
 
-async def poll_walk(target_name: str, auth, transport, oid_cfg: Dict[str, Any]):
-    base_topic = f"{daemon_args.mqtt_topic}/{target_name}"
+async def poll_walk(target_name: str, engine, auth, transport, oid_cfg: Dict[str, Any], stop):
+    base_topic = f"{config.mqtt_topic}/{target_name}"
     root_oid = oid_cfg['oid']
-    while True:
+    while not stop():
         try:
-            varBinds = await walk_once(auth, transport, root_oid)
+            varBinds = await walk_once(engine, auth, transport, root_oid)
             for name_str, val_str in varBinds:
                 index = compute_index_suffix(root_oid, name_str)
                 topic = f"{base_topic}/{oid_cfg.get('name') or root_oid}"
                 if index:
                     topic = f"{topic}/{index}"
                 payload = _transform(val_str, oid_cfg.get('transform'))
-                publish_mqtt(topic, payload)
+                iot_daemonize.mqtt_client.publish(topic, payload)
         except Exception as e:
             logging.warning(f"SNMP WALK loop error for {target_name} {root_oid}: {e}")
         await asyncio.sleep(int(target_interval(transport)))
 
 
-def publish_mqtt(topic: str, value: Any):
-    global mqtt_client, daemon_args
-    logging.info(f"Topic: {topic}, Payload: {value}")
-    mqtt_client.publish(topic, str(value))
-    if daemon_args.timestamp:
-        mqtt_client.publish(f"{topic}/timestamp", time.time(), retain=True)
-
-
-async def run_target(target: Dict[str, Any]):
-    global snmp_engine
-    name = target.get('name') or f"{target.get('host')}_{target.get('port',161)}"
+async def run_target(target: Dict[str, Any], engine, stop):
+    name = target.get('name') or f"{target.get('host')}_{target.get('port', 161)}"
     auth = build_auth(target)
     host = target.get('host', 'localhost')
     port = int(target.get('port', 161))
@@ -305,9 +181,9 @@ async def run_target(target: Dict[str, Any]):
     tasks = []
     for oid_cfg in (target.get('oids') or []):
         if oid_cfg.get('walk'):
-            tasks.append(asyncio.create_task(poll_walk(name, auth, transport, oid_cfg)))
+            tasks.append(asyncio.create_task(poll_walk(name, engine, auth, transport, oid_cfg, stop)))
         else:
-            tasks.append(asyncio.create_task(poll_scalar(name, auth, transport, oid_cfg)))
+            tasks.append(asyncio.create_task(poll_scalar(name, engine, auth, transport, oid_cfg, stop)))
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
@@ -316,51 +192,38 @@ async def run_target(target: Dict[str, Any]):
         raise
 
 
-def shutdown(signum, frame):
-    logging.info('Shutdown...')
-    if mqtt_client is not None:
-        logging.info('Stopping MQTT')
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
-    try:
-        loop = asyncio.get_event_loop()
-        for task in poll_tasks:
-            task.cancel()
-    except Exception:
-        pass
-    logging.info('Bye!')
-    sys.exit(0)
-
-
-async def main_async():
-    global daemon_args, mqtt_client, snmp_engine, poll_tasks
-    snmp_engine = SnmpEngine()
-
-    # MQTT connection
-    mqtt_client = init_mqtt()
-    mqtt_client.loop_start()
-
-    # Start targets
-    for target in daemon_args.targets:
-        poll_tasks.append(asyncio.create_task(run_target(target)))
-
-    await asyncio.gather(*poll_tasks)
+def poll_snmp(stop):
+    if config.targets is None:
+        return
+    loop = asyncio.new_event_loop()
+    engine = SnmpEngine()
+    for target in config.targets:
+        loop.create_task(run_target(target, engine, stop))
+    loop.run_forever()
 
 
 def main():
-    global daemon_args
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    global config
 
-    daemon_args = parse_args()
-    parse_config()
+    config = configuration.MqttDaemonConfiguration(
+        program='snmp2mqtt',
+        description='An SNMP to MQTT bridge')
+    config.add_config_arg('mqtt_clientid', flags='--mqtt_clientid', default='snmp2mqtt',
+                         help='The clientid to send to the MQTT server. Default is snmp2mqtt.')
+    config.add_config_arg('mqtt_topic', flags='--mqtt_topic', default='bus/snmp',
+                         help='The topic to publish MQTT messages. Default is bus/snmp.')
+    config.add_config_arg('config', flags=['-c', '--config'], default='/etc/snmp2mqtt.conf',
+                         help='The path to the config file. Default is /etc/snmp2mqtt.conf.')
+    config.add_config_arg('targets',
+                         help='The SNMP targets to poll.')
+    config.parse_args()
+    config.parse_config(config.config)
 
-    if daemon_args.verbose:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
+    iot_daemonize.init(config, mqtt=True, daemonize=True)
 
-    asyncio.run(main_async())
+    iot_daemonize.daemon.add_task(poll_snmp)
+
+    iot_daemonize.run()
 
 
 if __name__ == '__main__':
