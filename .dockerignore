@@ -1,3 +1,5 @@
 *
-!snmp2mqtt
-!requirements.txt
+!pyproject.toml
+!README.md
+!LICENSE.md
+!src
