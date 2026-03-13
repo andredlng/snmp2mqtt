@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 import iot_daemonize
@@ -110,9 +111,11 @@ async def poll_scalar(target_name: str, engine, auth, transport, oid_cfg: Dict[s
             varBinds = await poll_scalar_once(engine, auth, transport, oid)
             for _name, val in varBinds:
                 payload = _transform(val, oid_cfg.get('transform'))
+                logging.info("Target: {}, OID: {}, Value: {}".format(target_name, oid, payload))
                 iot_daemonize.mqtt_client.publish(f"{base_topic}/{name}", payload)
-        except Exception as e:
-            logging.warning(f"SNMP GET error for {target_name} {oid}: {e}")
+                logging.info("Topic: {}, Payload: {}".format(f"{base_topic}/{name}", payload))
+        except Exception:
+            logging.error(traceback.format_exc())
         await asyncio.sleep(int(target_interval(transport)))
 
 
@@ -161,9 +164,11 @@ async def poll_walk(target_name: str, engine, auth, transport, oid_cfg: Dict[str
                 if index:
                     topic = f"{topic}/{index}"
                 payload = _transform(val_str, oid_cfg.get('transform'))
+                logging.info("Target: {}, OID: {}, Value: {}".format(target_name, name_str, payload))
                 iot_daemonize.mqtt_client.publish(topic, payload)
-        except Exception as e:
-            logging.warning(f"SNMP WALK loop error for {target_name} {root_oid}: {e}")
+                logging.info("Topic: {}, Payload: {}".format(topic, payload))
+        except Exception:
+            logging.error(traceback.format_exc())
         await asyncio.sleep(int(target_interval(transport)))
 
 
